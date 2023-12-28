@@ -11,6 +11,8 @@ Supported commands:
 
 The bot sends a notification on any change to course schedules.
 
+<img src="example.png" alt="Telegram screenshot" width="600">
+
 ## Installation
 Requirements: Python 3.9+
 
