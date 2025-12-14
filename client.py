@@ -46,8 +46,8 @@ class UWAPIClient:
 
     async def get_default_term(self):
         current_term = await self.get_current_term()
-        next_term = await self.get_next_term()
         if datetime.now() > current_term["start_date"] + timedelta(days=60):  # 2 months after term start
+            next_term = await self.get_next_term()
             return next_term
         else:
             return current_term
