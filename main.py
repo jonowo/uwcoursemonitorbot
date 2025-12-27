@@ -20,7 +20,7 @@ from utils import course_to_str
 
 # data.json format: course code -> list of schedule dicts
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATA_PATH = "./data.json"
@@ -50,8 +50,10 @@ def read_data() -> dict[str, Any]:
         # Why doesn't orjson deserialize datetimes? workaround
         for sections in data.values():
             for section in sections:
-                section["start_time"] = datetime.strptime(section["start_time"], "%H:%M:%S").time()
-                section["end_time"] = datetime.strptime(section["end_time"], "%H:%M:%S").time()
+                if section["start_time"] is not None:
+                    section["start_time"] = datetime.strptime(section["start_time"], "%H:%M:%S").time()
+                if section["end_time"] is not None:
+                    section["end_time"] = datetime.strptime(section["end_time"], "%H:%M:%S").time()
         return data
 
 
@@ -79,7 +81,7 @@ async def command_help_handler(message: Message) -> None:
 
 @dp.message(Command("list"))
 @owner_only
-async def command_monitor_handler(message: Message) -> None:
+async def command_list_handler(message: Message) -> None:
     async with data_lock:
         data = read_data()
 
@@ -92,7 +94,7 @@ async def command_monitor_handler(message: Message) -> None:
 
 @dp.message(Command("clear"))
 @owner_only
-async def command_monitor_handler(message: Message) -> None:
+async def command_clear_handler(message: Message) -> None:
     async with data_lock:
         write_data({})
     await message.answer("List cleared!")
@@ -184,6 +186,8 @@ async def bg_loop() -> None:
     try:
         logger.info("Starting background loop...")
         while True:
+            logger.info("Checking course schedules for updates...")
+
             async with data_lock:
                 keys = read_data().keys()
 
