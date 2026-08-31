@@ -3,7 +3,7 @@ import functools
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import orjson
@@ -20,12 +20,11 @@ from dotenv import load_dotenv
 from client import UWAPIClient
 from utils import course_to_str
 
-# data.json format: course code -> list of schedule dicts
-
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATA_PATH = "./data.json"
+POLL_INTERVAL = 15
 data_lock = asyncio.Lock()
 
 load_dotenv()
@@ -49,9 +48,8 @@ def owner_only(handler: Callable) -> Callable:
 def read_data() -> dict[str, Any]:
     with open(DATA_PATH, "rb") as f:
         data = orjson.loads(f.read())
-        # Why doesn't orjson deserialize datetimes? workaround
-        for sections in data.values():
-            for section in sections:
+        for course in data.values():
+            for section in course["schedules"]:
                 if section["start_time"] is not None:
                     section["start_time"] = datetime.strptime(section["start_time"], "%H:%M:%S").time()
                 if section["end_time"] is not None:
@@ -62,6 +60,10 @@ def read_data() -> dict[str, Any]:
 def write_data(data: dict[str, Any]) -> None:
     with open(DATA_PATH, "wb") as f:
         f.write(orjson.dumps(data))
+
+
+def get_now_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 async def retry_async(
@@ -108,7 +110,7 @@ async def command_list_handler(message: Message) -> None:
         await message.answer("Course list is empty!")
         return
 
-    await message.answer("\n\n".join(course_to_str(key, section) for key, section in data.items()))
+    await message.answer("\n\n".join(course_to_str(key, course["schedules"]) for key, course in data.items()))
 
 
 @dp.message(Command("clear"))
@@ -153,10 +155,9 @@ async def command_add_handler(message: Message, command: CommandObject) -> None:
         else:
             raise
 
-    # Add to file
     async with data_lock:
         data = read_data()
-        data[key] = course_schedules
+        data[key] = {"last_polled_at": None, "schedules": course_schedules}
         write_data(data)
 
     await message.answer(f"{key} added to list!")
@@ -208,15 +209,26 @@ async def bg_loop() -> None:
     try:
         logger.info("Starting background loop...")
         while True:
-            logger.info("Checking course schedules for updates...")
+            course_key = None
+            old_course_schedules = []
+            selected_poll_timestamp = None
 
             try:
                 async with data_lock:
-                    keys = list(read_data())
+                    data = read_data()
+                    if data:
+                        course_key = min(data, key=lambda k: data[k]["last_polled_at"] or "")
+                        old_course_schedules = data[course_key]["schedules"]
+                        # This timestamp reserves the polling turn and identifies this in-flight record.
+                        selected_poll_timestamp = get_now_timestamp()
+                        data[course_key]["last_polled_at"] = selected_poll_timestamp
+                        write_data(data)
 
-                for key in keys:
+                if course_key is not None:
+                    new_course_schedules = None
+                    notification_delivered = False
                     try:
-                        term_name, _, course_code = key.partition(" ")
+                        term_name, _, course_code = course_key.partition(" ")
                         term = await retry_async(
                             lambda term_name=term_name: client.get_term_with_name(term_name),
                             (ClientError, asyncio.TimeoutError)
@@ -228,33 +240,23 @@ async def bg_loop() -> None:
                             (ClientError, asyncio.TimeoutError)
                         )
 
+                        if old_course_schedules != new_course_schedules:
+                            await notify_course_schedules_diff(course_key, old_course_schedules, new_course_schedules)
+                        notification_delivered = True
+                    finally:
                         async with data_lock:
                             data = read_data()
-                            if key not in data:
-                                continue
-
-                            old_course_schedules = data[key]
-
-                        if old_course_schedules != new_course_schedules:
-                            await notify_course_schedules_diff(key, old_course_schedules, new_course_schedules)
-
-                            async with data_lock:
-                                data = read_data()
-                                if key in data:
-                                    data[key] = new_course_schedules
-                                    write_data(data)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception("Failed to check %s", key)
-
-                    await asyncio.sleep(10)
+                            # Do not apply stale work after a course was removed and re-added.
+                            if course_key in data and data[course_key]["last_polled_at"] == selected_poll_timestamp:
+                                if notification_delivered and old_course_schedules != new_course_schedules:
+                                    data[course_key]["schedules"] = new_course_schedules
+                                write_data(data)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Failed to check course schedules")
+                logger.exception("Failed to check %s", course_key)
 
-            await asyncio.sleep(120)
+            await asyncio.sleep(POLL_INTERVAL)
     except asyncio.CancelledError:
         logger.info("Ending background loop...")
         raise
