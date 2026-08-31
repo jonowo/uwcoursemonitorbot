@@ -4,15 +4,17 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import orjson
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import Message
 from aiogram.utils.markdown import hbold, hcode
-from aiohttp import ClientResponseError
+from aiohttp import ClientError, ClientResponseError
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from dotenv import load_dotenv
 
 from client import UWAPIClient
@@ -29,7 +31,7 @@ data_lock = asyncio.Lock()
 load_dotenv()
 
 USER_ID = int(os.environ["USER_ID"])
-bot = Bot(os.environ["BOT_TOKEN"], parse_mode=ParseMode.HTML)
+bot = Bot(os.environ["BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 client = UWAPIClient(os.environ["UW_API_KEY"])
 
@@ -62,6 +64,23 @@ def write_data(data: dict[str, Any]) -> None:
         f.write(orjson.dumps(data))
 
 
+async def retry_async(
+    operation: Callable[[], Awaitable[Any]],
+    retry_exceptions: tuple[type[BaseException], ...],
+    max_attempts: int = 3,
+    base_delay: int = 2
+) -> Any:
+    for attempt in range(max_attempts):
+        try:
+            return await operation()
+        except retry_exceptions as e:
+            if attempt == max_attempts - 1:
+                raise
+            delay = getattr(e, "retry_after", base_delay * 2 ** attempt)
+            logger.warning("%s; retrying in %s seconds", e, delay)
+            await asyncio.sleep(delay)
+
+
 @dp.message(CommandStart())
 @owner_only
 async def command_start_handler(message: Message) -> None:
@@ -72,10 +91,10 @@ async def command_start_handler(message: Message) -> None:
 @owner_only
 async def command_help_handler(message: Message) -> None:
     await message.answer(
-        f"{hcode("/add (term) (course code)")} - Add a course to the list, e.g., {hcode("/add W23 MATH 237")}\n"
-        f"{hcode("/remove (term) [course code]")} - Remove a course from the list\n"
-        f"{hcode("/list")} - List all courses in the list\n"
-        f"{hcode("/clear")} - Clear the list"
+        f"{hcode('/add (term) (course code)')} - Add a course to the list, e.g., {hcode('/add W23 MATH 237')}\n"
+        f"{hcode('/remove (term) [course code]')} - Remove a course from the list\n"
+        f"{hcode('/list')} - List all courses in the list\n"
+        f"{hcode('/clear')} - Clear the list"
     )
 
 
@@ -179,7 +198,10 @@ async def notify_course_schedules_diff(key: str, old_schedules, new_schedules):
     else:
         final_msg = new_msg
 
-    await bot.send_message(USER_ID, "Course info changed:\n\n" + "\n".join(final_msg))
+    await retry_async(
+        lambda: bot.send_message(USER_ID, "Course info changed:\n\n" + "\n".join(final_msg)),
+        (TelegramNetworkError, TelegramRetryAfter, TelegramServerError, asyncio.TimeoutError)
+    )
 
 
 async def bg_loop() -> None:
@@ -188,27 +210,49 @@ async def bg_loop() -> None:
         while True:
             logger.info("Checking course schedules for updates...")
 
-            async with data_lock:
-                keys = read_data().keys()
-
-            for key in keys:
-                term_name, _, course_code = key.partition(" ")
-                term = await client.get_term_with_name(term_name)
-                new_course_schedules = await client.get_class_schedules(term["code"], course_code)
-
+            try:
                 async with data_lock:
-                    data = read_data()
-                    if key not in data:  # because it might have been removed
-                        continue
+                    keys = list(read_data())
 
-                    old_course_schedules = data[key]
-                    data[key] = new_course_schedules
-                    write_data(data)
+                for key in keys:
+                    try:
+                        term_name, _, course_code = key.partition(" ")
+                        term = await retry_async(
+                            lambda term_name=term_name: client.get_term_with_name(term_name),
+                            (ClientError, asyncio.TimeoutError)
+                        )
+                        new_course_schedules = await retry_async(
+                            lambda term_code=term["code"], course_code=course_code: client.get_class_schedules(
+                                term_code, course_code
+                            ),
+                            (ClientError, asyncio.TimeoutError)
+                        )
 
-                    if old_course_schedules != new_course_schedules:
-                        await notify_course_schedules_diff(key, old_course_schedules, new_course_schedules)
+                        async with data_lock:
+                            data = read_data()
+                            if key not in data:
+                                continue
 
-                await asyncio.sleep(10)
+                            old_course_schedules = data[key]
+
+                        if old_course_schedules != new_course_schedules:
+                            await notify_course_schedules_diff(key, old_course_schedules, new_course_schedules)
+
+                            async with data_lock:
+                                data = read_data()
+                                if key in data:
+                                    data[key] = new_course_schedules
+                                    write_data(data)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Failed to check %s", key)
+
+                    await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to check course schedules")
 
             await asyncio.sleep(120)
     except asyncio.CancelledError:

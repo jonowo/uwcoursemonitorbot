@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from aiocache import cached
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 
 
 class UWAPIClient:
@@ -73,7 +73,11 @@ class UWAPIClient:
         return sorted([self._parse_class_schedule(cs) for cs in data], key=lambda s: s["section_name"])
 
     async def init(self):
-        self.client = ClientSession(headers={"X-API-KEY": self._api_key}, raise_for_status=True)
+        self.client = ClientSession(
+            headers={"X-API-KEY": self._api_key},
+            raise_for_status=True,
+            timeout=ClientTimeout(total=30, connect=10)
+        )
 
     async def close(self):
         await self.client.close()
